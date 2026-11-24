@@ -61,6 +61,10 @@ invalidates the whole family, every token in it, not just the token that was
 presented.
 """
 
+import hashlib
+import hmac
+from collections.abc import Mapping
+
 TOKEN_LENGTH = 64
 MIN_ENTROPY_BYTES = 32
 MAX_ABSOLUTE_TTL_SECONDS = 2_592_000
@@ -73,6 +77,187 @@ POLICY_ISSUE_ORDER = (
     POLICY_ISSUE_ABSOLUTE,
     POLICY_ISSUE_BINDING,
 )
+
+_FAMILY_DOMAIN = b"refresh-family-v1"
+_TOKEN_DOMAIN = b"refresh-token-v1"
+_FIELD_SEPARATOR = b"\x1f"
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _encode_field(value):
+    """Length-prefix a string field so concatenations cannot be ambiguous."""
+    data = value.encode("utf-8")
+    return len(data).to_bytes(4, "big") + data
+
+
+def _secret_bytes(store):
+    secret = store.get("secret") if isinstance(store, Mapping) else None
+    if not isinstance(secret, (bytes, bytearray, memoryview)):
+        raise ValueError("store['secret'] must be bytes-like")
+    return bytes(secret)
+
+
+def _next_seq(store):
+    seq = store.get("seq", 0)
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise ValueError("store['seq'] must be a non-negative int")
+    return seq
+
+
+def _derive_family_id(secret, user, client, entropy, seq):
+    material = _FIELD_SEPARATOR.join(
+        (
+            _FAMILY_DOMAIN,
+            _encode_field(user),
+            _encode_field(client),
+            bytes(entropy),
+            str(seq).encode("ascii"),
+        )
+    )
+    return hmac.new(secret, material, hashlib.sha256).hexdigest()[:32]
+
+
+def _derive_token(secret, family, seq, previous, entropy=None):
+    parts = [
+        _TOKEN_DOMAIN,
+        _encode_field(family["family_id"]),
+        _encode_field(family["user"]),
+        _encode_field(family["client"]),
+        str(seq).encode("ascii"),
+        _encode_field(previous if previous is not None else ""),
+    ]
+    if entropy is not None:
+        parts.append(bytes(entropy))
+    digest = hmac.new(secret, _FIELD_SEPARATOR.join(parts), hashlib.sha256)
+    return digest.hexdigest()
+
+
+def _mint(store, family, previous, now, entropy=None):
+    """Mint one token for ``family``, advancing the store sequence once."""
+    secret = _secret_bytes(store)
+    seq = _next_seq(store)
+    value = _derive_token(secret, family, seq, previous, entropy)
+    store["seq"] = seq + 1
+
+    record = {
+        "token": value,
+        "family_id": family["family_id"],
+        "user": family["user"],
+        "client": family["client"],
+        "created_at": family["created_at"],
+        "issued_at": now,
+        "last_used_at": now,
+        "used_at": None,
+        "previous": previous,
+    }
+    family["tokens"].append(value)
+    store["tokens"][value] = record
+    return record
+
+
+def _failure(reason, family_id):
+    return {
+        "ok": False,
+        "reason": reason,
+        "family_id": family_id if isinstance(family_id, str) else "",
+        "token": None,
+    }
+
+
+def _presented_value(refresh):
+    if not isinstance(refresh, Mapping):
+        return None
+    value = refresh.get("token")
+    return value if isinstance(value, str) else None
+
+
+def _claimed_family_id(refresh):
+    if not isinstance(refresh, Mapping):
+        return ""
+    value = refresh.get("family_id")
+    return value if isinstance(value, str) else ""
+
+
+def _lookup(store, refresh):
+    """Return ``(record, family)`` from the store for a presented token."""
+    if not isinstance(store, Mapping):
+        return None, None
+    value = _presented_value(refresh)
+    if value is None:
+        return None, None
+    record = store.get("tokens", {}).get(value)
+    if not isinstance(record, Mapping):
+        return None, None
+    family = store.get("families", {}).get(record.get("family_id"))
+    if not isinstance(family, Mapping):
+        return None, None
+    return record, family
+
+
+def _revoke(store, family_id, stamp):
+    """Revoke one family; return the number of tokens newly invalidated."""
+    if not isinstance(store, Mapping) or not isinstance(family_id, str):
+        return 0
+    family = store.get("families", {}).get(family_id)
+    if not isinstance(family, Mapping):
+        return 0
+    if family.get("revoked_at") is not None:
+        return 0
+    family["revoked_at"] = stamp
+    return len(family.get("tokens", []))
+
+
+def _positive_int(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _policy_value(policy, key):
+    if not isinstance(policy, Mapping):
+        return None
+    return policy.get(key)
+
+
+def _rotate_locked(store, record, family, now):
+    """Consume ``record`` and append one freshly minted token."""
+    record["used_at"] = now
+    new_record = _mint(
+        store, family, previous=record["token"], now=now
+    )
+    return {
+        "ok": True,
+        "reason": "rotated",
+        "family_id": family["family_id"],
+        "old_token": record["token"],
+        "token": new_record,
+    }
+
+
+def _resolve_store_token(store, refresh):
+    """Resolve and classify a presented token against its own store.
+
+    Returns ``(record, family, failure)``; exactly one side is meaningful.
+    The checks here are the shared prefix of ``rotate`` and ``refresh_batch``:
+    unknown token, revoked family, then reuse of an already-rotated token.
+    """
+    record, family = _lookup(store, refresh)
+    if record is None:
+        return None, None, _failure("unknown", _claimed_family_id(refresh))
+    family_id = family["family_id"]
+    if family.get("revoked_at") is not None:
+        return None, None, _failure("revoked", family_id)
+    if record.get("used_at") is not None:
+        _revoke(store, family_id, record["used_at"])
+        return None, None, _failure("reuse", family_id)
+    return record, family, None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def issue_family(store, user, client, entropy, now):
@@ -109,7 +294,31 @@ def issue_family(store, user, client, entropy, now):
         ValueError: If ``user`` or ``client`` is not a non-empty string, or if
             ``entropy`` is shorter than ``MIN_ENTROPY_BYTES``.
     """
-    raise NotImplementedError
+    if not isinstance(user, str) or not user:
+        raise ValueError("user must be a non-empty string")
+    if not isinstance(client, str) or not client:
+        raise ValueError("client must be a non-empty string")
+    if not isinstance(entropy, (bytes, bytearray, memoryview)):
+        raise ValueError("entropy must be bytes-like")
+    if len(entropy) < MIN_ENTROPY_BYTES:
+        raise ValueError(
+            "entropy must be at least %d bytes" % MIN_ENTROPY_BYTES
+        )
+
+    secret = _secret_bytes(store)
+    seq = _next_seq(store)
+    family_id = _derive_family_id(secret, user, client, entropy, seq)
+
+    family = {
+        "family_id": family_id,
+        "user": user,
+        "client": client,
+        "created_at": now,
+        "revoked_at": None,
+        "tokens": [],
+    }
+    store["families"][family_id] = family
+    return _mint(store, family, previous=None, now=now, entropy=entropy)
 
 
 def rotate(store, refresh, now, policy):
@@ -150,7 +359,12 @@ def rotate(store, refresh, now, policy):
 
             {"ok": False, "reason": str, "family_id": str, "token": None}
     """
-    raise NotImplementedError
+    record, family, failure = _resolve_store_token(store, refresh)
+    if failure is not None:
+        return failure
+    if not ttl_ok(record, now, policy):
+        return _failure("expired", family["family_id"])
+    return _rotate_locked(store, record, family, now)
 
 
 def check_reuse(store, refresh):
@@ -172,7 +386,37 @@ def check_reuse(store, refresh):
         where ``revoked`` counts the token values newly invalidated by this
         call (zero when the family was already revoked, unknown, or live).
     """
-    raise NotImplementedError
+    record, family = _lookup(store, refresh)
+    if record is None:
+        return {
+            "reuse": False,
+            "reason": "unknown",
+            "family_id": _claimed_family_id(refresh),
+            "revoked": 0,
+        }
+
+    family_id = family["family_id"]
+    if family.get("revoked_at") is not None:
+        return {
+            "reuse": True,
+            "reason": "revoked",
+            "family_id": family_id,
+            "revoked": 0,
+        }
+    if record.get("used_at") is not None:
+        revoked = _revoke(store, family_id, record["used_at"])
+        return {
+            "reuse": True,
+            "reason": "used",
+            "family_id": family_id,
+            "revoked": revoked,
+        }
+    return {
+        "reuse": False,
+        "reason": "ok",
+        "family_id": family_id,
+        "revoked": 0,
+    }
 
 
 def revoke_family(store, family_id, now):
@@ -188,7 +432,7 @@ def revoke_family(store, family_id, now):
         ``int``.  All tokens of a live family are counted, so a family with
         one rotated-away token and one live token returns ``2``.
     """
-    raise NotImplementedError
+    return _revoke(store, family_id, now)
 
 
 def bind_ok(refresh, client):
@@ -204,7 +448,12 @@ def bind_ok(refresh, client):
         ``False`` for a mismatch, a missing or non-string record field, or an
         empty or non-string ``client``.
     """
-    raise NotImplementedError
+    if not isinstance(client, str) or not client:
+        return False
+    if not isinstance(refresh, Mapping):
+        return False
+    bound = refresh.get("client")
+    return isinstance(bound, str) and bound != "" and bound == client
 
 
 def ttl_ok(refresh, now, policy):
@@ -225,7 +474,28 @@ def ttl_ok(refresh, now, policy):
         limits.  A policy whose limits are missing or not positive ``int``
         values yields ``False`` rather than an exception.
     """
-    raise NotImplementedError
+    if not isinstance(refresh, Mapping):
+        return False
+    absolute_ttl = _policy_value(policy, "absolute_ttl_seconds")
+    idle_ttl = _policy_value(policy, "idle_ttl_seconds")
+    if not _positive_int(absolute_ttl) or not _positive_int(idle_ttl):
+        return False
+
+    created_at = refresh.get("created_at")
+    last_used_at = refresh.get("last_used_at")
+    if (
+        not isinstance(created_at, int)
+        or isinstance(created_at, bool)
+        or not isinstance(last_used_at, int)
+        or isinstance(last_used_at, bool)
+        or not isinstance(now, int)
+        or isinstance(now, bool)
+    ):
+        return False
+
+    absolute_valid = now - created_at < absolute_ttl * 1000
+    idle_valid = now - last_used_at < idle_ttl * 1000
+    return absolute_valid and idle_valid
 
 
 def validate_policy(policy):
@@ -247,7 +517,22 @@ def validate_policy(policy):
         A ``list[str]`` of problem codes, empty when the policy is acceptable.
         A policy at exactly ``MAX_ABSOLUTE_TTL_SECONDS`` is acceptable.
     """
-    raise NotImplementedError
+    issues = []
+
+    if _policy_value(policy, "reuse_detection") is not True:
+        issues.append(POLICY_ISSUE_REUSE)
+
+    absolute_ttl = _policy_value(policy, "absolute_ttl_seconds")
+    if (
+        not _positive_int(absolute_ttl)
+        or absolute_ttl > MAX_ABSOLUTE_TTL_SECONDS
+    ):
+        issues.append(POLICY_ISSUE_ABSOLUTE)
+
+    if _policy_value(policy, "client_binding") is not True:
+        issues.append(POLICY_ISSUE_BINDING)
+
+    return issues
 
 
 def refresh_batch(requests, policy, now):
@@ -271,4 +556,29 @@ def refresh_batch(requests, policy, now):
         in request order.  A result is the successful rotation dict, or
         ``{"ok": False, "reason": str, "family_id": str, "token": None}``.
     """
-    raise NotImplementedError
+    results = []
+    for request in requests:
+        if not isinstance(request, Mapping):
+            results.append(_failure("unknown", ""))
+            continue
+
+        store = request.get("store")
+        refresh = request.get("token")
+        client = request.get("client")
+
+        record, family, failure = _resolve_store_token(store, refresh)
+        if failure is not None:
+            results.append(failure)
+            continue
+
+        family_id = family["family_id"]
+        if not bind_ok(record, client):
+            results.append(_failure("client_mismatch", family_id))
+            continue
+        if not ttl_ok(record, now, policy):
+            results.append(_failure("expired", family_id))
+            continue
+
+        results.append(_rotate_locked(store, record, family, now))
+
+    return {"results": results}
